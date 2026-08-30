@@ -2929,6 +2929,7 @@ def _run_single_child(
 
             _error_entry = {
                 "task_index": task_index,
+                "subagent_id": _subagent_id,
                 "status": "timeout" if is_timeout else "error",
                 "summary": None,
                 "error": _err,
@@ -3118,6 +3119,10 @@ def _run_single_child(
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
+            # This id is allocated before launch and is also child_task_id.
+            # Keep it on every terminal result so a parent can prove the
+            # result came from the child it launched, not another completion.
+            "subagent_id": _subagent_id,
             "status": status,
             "summary": summary,
             "api_calls": api_calls,
@@ -3312,6 +3317,7 @@ def _run_single_child(
                 logger.debug("Progress callback failure relay failed: %s", e)
         _error_entry = {
             "task_index": task_index,
+            "subagent_id": _subagent_id,
             "status": "error",
             "summary": None,
             "error": str(exc),
@@ -3402,6 +3408,43 @@ def _run_single_child(
 _PARENT_FINALIZATION_LOCK_GUARD = threading.Lock()
 _PARENT_FINALIZATION_FALLBACK_LOCK = threading.RLock()
 _CHILD_CONSTRUCTION_LOCK = threading.RLock()
+
+
+def _enforce_foreground_result_identity(
+    children: List[tuple], results: List[Dict[str, Any]],
+) -> None:
+    """Reject terminal entries not returned for their pre-built child.
+
+    Foreground delegation owns ``children`` for the lifetime of the call and
+    joins the futures that run those exact objects.  This final check makes
+    the immutable pre-launch id an explicit acceptance boundary: a result
+    from another child (or any stale shared artifact) cannot satisfy it.
+    """
+    expected_child_ids = {
+        index: subagent_id
+        for index, _task, child in children
+        if isinstance(
+            (subagent_id := getattr(child, "_subagent_id", None)), str
+        ) and subagent_id
+    }
+    for entry in results:
+        index = entry.get("task_index")
+        expected_id = expected_child_ids.get(index)
+        actual_id = entry.get("subagent_id")
+        if expected_id and actual_id != expected_id:
+            entry.update(
+                {
+                    "subagent_id": expected_id,
+                    "status": "error",
+                    "summary": None,
+                    "error": (
+                        "Delegation correlation mismatch: terminal result "
+                        f"for child {actual_id!r} cannot satisfy launched "
+                        f"child {expected_id!r}."
+                    ),
+                    "exit_reason": "correlation_mismatch",
+                }
+            )
 
 
 def _build_child_preserving_parent_tools(**kwargs):
@@ -4012,6 +4055,9 @@ def delegate_task(
                                 except Exception as exc:
                                     entry = {
                                         "task_index": idx,
+                                        "subagent_id": getattr(
+                                            _child_by_index.get(idx), "_subagent_id", None
+                                        ),
                                         "status": "error",
                                         "summary": None,
                                         "error": str(exc),
@@ -4024,6 +4070,9 @@ def delegate_task(
                             else:
                                 entry = {
                                     "task_index": idx,
+                                    "subagent_id": getattr(
+                                        _child_by_index.get(idx), "_subagent_id", None
+                                    ),
                                     "status": "interrupted",
                                     "summary": None,
                                     "error": "Parent agent interrupted — child did not finish in time",
@@ -4049,6 +4098,9 @@ def delegate_task(
                             idx = futures[future]
                             entry = {
                                 "task_index": idx,
+                                "subagent_id": getattr(
+                                    _child_by_index.get(idx), "_subagent_id", None
+                                ),
                                 "status": "error",
                                 "summary": None,
                                 "error": str(exc),
@@ -4090,6 +4142,12 @@ def delegate_task(
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
+
+        # A foreground parent accepts terminal evidence only from the exact
+        # child object constructed for this invocation.  Real children receive
+        # this immutable id before launch; legacy/test doubles without an id
+        # retain their historical direct-call behavior.
+        _enforce_foreground_result_identity(children, results)
 
         # Cap subagent summaries against the parent's remaining context
         # headroom (split across the batch) before they enter the parent's

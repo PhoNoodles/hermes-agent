@@ -1306,10 +1306,12 @@ class TestDelegateHeartbeat(unittest.TestCase):
         """A slow in-flight model wait (api_call_count frozen, no tool) must
         stay alive when last_activity_ts keeps advancing.
 
-        Top-level delegate_task runs in the background; the async stall
-        monitor already treats ticking last_activity_ts as progress. The sync
-        heartbeat path must use the same signal so slow local / long-prefill
-        completions are not mistaken for a wedged idle child.
+        Authoritative AIAgent dispatch calls ``delegate_task(background=False)``;
+        only an explicit direct ``delegate_task(background=True)`` dispatch is
+        asynchronous.  The async stall monitor already treats ticking
+        last_activity_ts as progress, and the foreground heartbeat path must
+        use the same signal so slow local / long-prefill completions are not
+        mistaken for a wedged idle child.
         """
         from tools.delegate_tool import _run_single_child
 
@@ -1898,6 +1900,137 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         self.assertEqual(seen, [_subagent_auto_deny])
         # Parent's callback slot is still empty (TLS isolates threads).
         self.assertIsNone(_get_approval_callback())
+
+
+class TestForegroundDelegationIdentity(unittest.TestCase):
+    """Foreground results must remain owned by their pre-built children."""
+
+    @staticmethod
+    def _child(subagent_id, run):
+        child = MagicMock()
+        child._subagent_id = subagent_id
+        child._delegate_depth = 1
+        child._delegate_role = "leaf"
+        child._credential_pool = None
+        child.get_activity_summary.return_value = {
+            "current_tool": None,
+            "api_call_count": 0,
+            "max_iterations": 1,
+            "last_activity_desc": "",
+        }
+        child.run_conversation.side_effect = run
+        return child
+
+    def test_foreground_parent_waits_for_exact_prebuilt_child(self):
+        """The return is pending until the known child produces its result."""
+        release = threading.Event()
+        started = threading.Event()
+
+        def run_a(**kwargs):
+            self.assertEqual(kwargs["task_id"], "sa-0-knownA00")
+            started.set()
+            self.assertTrue(release.wait(2))
+            return {"final_response": "A terminal", "completed": True, "api_calls": 1}
+
+        parent = _make_mock_parent()
+        child = self._child("known-A", run_a)
+        from concurrent.futures import ThreadPoolExecutor
+
+        with (
+            patch("run_agent.AIAgent", return_value=child),
+            patch("uuid.uuid4", return_value=types.SimpleNamespace(hex="knownA00")),
+            patch("tools.async_delegation.dispatch_async_delegation_batch") as async_dispatch,
+            ThreadPoolExecutor(1) as executor,
+        ):
+            future = executor.submit(delegate_task, goal="A", parent_agent=parent)
+            self.assertTrue(started.wait(2))
+            self.assertFalse(future.done())
+            release.set()
+            result = json.loads(future.result(timeout=2))
+
+        # A stale persisted async completion is architecturally unobservable:
+        # this foreground invocation never dispatches or consumes that queue.
+        async_dispatch.assert_not_called()
+        self.assertEqual(result["results"][0]["subagent_id"], "sa-0-knownA00")
+        self.assertEqual(result["results"][0]["summary"], "A terminal")
+
+    def test_b_first_result_cannot_satisfy_pending_a(self):
+        """Known A/B ids retain direct ownership when B completes first."""
+        from concurrent.futures import ThreadPoolExecutor
+        from tools.delegate_tool import _run_single_child
+
+        release_a = threading.Event()
+        started_a = threading.Event()
+
+        def run_a(**kwargs):
+            self.assertEqual(kwargs["task_id"], "known-A")
+            started_a.set()
+            self.assertTrue(release_a.wait(2))
+            return {"final_response": "A terminal", "completed": True, "api_calls": 1}
+
+        def run_b(**kwargs):
+            self.assertEqual(kwargs["task_id"], "known-B")
+            return {"final_response": "B terminal", "completed": True, "api_calls": 1}
+
+        parent = _make_mock_parent()
+        child_a = self._child("known-A", run_a)
+        child_b = self._child("known-B", run_b)
+        with ThreadPoolExecutor(2) as executor:
+            a_future = executor.submit(_run_single_child, 0, "A", child_a, parent)
+            self.assertTrue(started_a.wait(2))
+            b_result = executor.submit(
+                _run_single_child, 1, "B", child_b, parent
+            ).result(timeout=2)
+            self.assertFalse(a_future.done())
+            self.assertEqual(b_result["subagent_id"], "known-B")
+            self.assertEqual(b_result["summary"], "B terminal")
+            release_a.set()
+            a_result = a_future.result(timeout=2)
+
+        self.assertEqual(a_result["subagent_id"], "known-A")
+        self.assertEqual(a_result["summary"], "A terminal")
+
+    def test_wrong_terminal_identity_is_rejected(self):
+        from tools.delegate_tool import _enforce_foreground_result_identity
+
+        child = self._child("known-A", lambda **_: None)
+        entries = [{
+            "task_index": 0,
+            "subagent_id": "known-B",
+            "status": "completed",
+            "summary": "B",
+        }]
+
+        _enforce_foreground_result_identity(
+            [(0, {"goal": "A"}, child)], entries
+        )
+
+        self.assertEqual(entries[0]["subagent_id"], "known-A")
+        self.assertEqual(entries[0]["status"], "error")
+        self.assertEqual(entries[0]["exit_reason"], "correlation_mismatch")
+
+    def test_failure_and_configured_timeout_keep_child_identity(self):
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent()
+        failed = self._child(
+            "known-failure",
+            lambda **_: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        failure = _run_single_child(0, "fails", failed, parent)
+        self.assertEqual(failure["subagent_id"], "known-failure")
+        self.assertEqual(failure["status"], "error")
+        self.assertIn("boom", failure["error"])
+
+        release = threading.Event()
+        timed_out = self._child("known-timeout", lambda **_: release.wait(2))
+        with patch("tools.delegate_tool._get_child_timeout", return_value=0.01):
+            timeout = _run_single_child(1, "times out", timed_out, parent)
+        release.set()
+
+        self.assertEqual(timeout["subagent_id"], "known-timeout")
+        self.assertEqual(timeout["status"], "timeout")
+        self.assertEqual(timeout["timeout_seconds"], 0.01)
 
 
 class TestFallbackModelInheritance(unittest.TestCase):

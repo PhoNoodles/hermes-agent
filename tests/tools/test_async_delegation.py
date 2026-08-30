@@ -637,7 +637,8 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     def slow_child(task_index, goal, child=None, parent_agent=None, **kw):
         gate.wait(timeout=60)  # a sync impl would hang delegate_task here
         return {
-            "task_index": 0, "status": "completed", "summary": f"done: {goal}",
+            "task_index": 0, "subagent_id": "s1",
+            "status": "completed", "summary": f"done: {goal}",
             "api_calls": 1, "duration_seconds": 0.1, "model": "m",
             "exit_reason": "completed",
         }
