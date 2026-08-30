@@ -4479,6 +4479,56 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
+    request_id = str(approval_data.get("request_id") or "")
+    active_surface = str(approval_data.get("active_surface") or surface or "gateway")
+    raw_diagnostics = approval_data.get("diagnostics")
+    has_diagnostics = isinstance(raw_diagnostics, dict)
+
+    def _diagnostics_payload(*, outcome: str, resolved: bool | None,
+                             wait_started: float, wait_ms: int | None = None) -> dict | None:
+        if not isinstance(raw_diagnostics, dict):
+            return None
+
+        def _copy_map(value):
+            return dict(value) if isinstance(value, dict) else {}
+
+        request_diag = _copy_map(raw_diagnostics.get("request"))
+        session_diag = _copy_map(raw_diagnostics.get("session"))
+        callback_diag = _copy_map(raw_diagnostics.get("callback"))
+        policy_diag = _copy_map(raw_diagnostics.get("policy"))
+        timing_diag = _copy_map(raw_diagnostics.get("timing"))
+        outcome_diag = _copy_map(raw_diagnostics.get("outcome"))
+
+        request_diag.setdefault("id", request_id)
+        request_diag.setdefault("surface", active_surface)
+        if primary_key:
+            request_diag.setdefault("pattern_key", primary_key)
+        if all_keys:
+            request_diag.setdefault("pattern_keys", list(all_keys))
+
+        if not session_diag.get("key_ref"):
+            try:
+                session_diag["key_ref"] = (
+                    f"session:{hashlib.sha256((session_key or '').encode('utf-8')).hexdigest()[:12]}"
+                )
+            except Exception:
+                session_diag["key_ref"] = "session:unavailable"
+
+        callback_diag.setdefault("kind", "gateway_notify" if notify_cb is not None else "unavailable")
+        timing_diag.setdefault("wait_started", "redacted")
+        if wait_ms is not None:
+            timing_diag["wait_ms"] = max(0, int(wait_ms))
+        outcome_diag["status"] = outcome
+        outcome_diag["resolved"] = resolved
+
+        return {
+            "request": request_diag,
+            "session": session_diag,
+            "callback": callback_diag,
+            "policy": policy_diag,
+            "timing": timing_diag,
+            "outcome": outcome_diag,
+        }
 
     # ── Coalesce identical concurrent approvals (one prompt, one answer) ──
     # Parallel tool calls (a parallel terminal batch, execute_code RPC
@@ -4529,15 +4579,24 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
     # Notify plugins that an approval is being requested. Fires before the
     # gateway notify callback so observers get the event in real time.
-    _fire_approval_hook(
-        "pre_approval_request",
-        command=command,
-        description=description,
-        pattern_key=primary_key,
-        pattern_keys=list(all_keys),
-        session_key=session_key,
-        surface=surface,
-    )
+    requested_at = time.monotonic()
+    pre_hook_kwargs = {
+        "command": command,
+        "description": description,
+        "pattern_key": primary_key,
+        "pattern_keys": list(all_keys),
+        "session_key": session_key,
+        "surface": active_surface,
+    }
+    if request_id:
+        pre_hook_kwargs["request_id"] = request_id
+    if has_diagnostics:
+        pre_hook_kwargs["diagnostics"] = _diagnostics_payload(
+            outcome="requested",
+            resolved=None,
+            wait_started=requested_at,
+        )
+    _fire_approval_hook("pre_approval_request", **pre_hook_kwargs)
 
     # Notify the user (bridges sync agent thread → async gateway)
     try:
@@ -4545,16 +4604,25 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
-        _fire_approval_hook(
-            "post_approval_response",
-            command=command,
-            description=description,
-            pattern_key=primary_key,
-            pattern_keys=list(all_keys),
-            session_key=session_key,
-            surface=surface,
-            choice="notify_failed",
-        )
+        post_hook_kwargs = {
+            "command": command,
+            "description": description,
+            "pattern_key": primary_key,
+            "pattern_keys": list(all_keys),
+            "session_key": session_key,
+            "surface": active_surface,
+            "choice": "notify_failed",
+        }
+        if request_id:
+            post_hook_kwargs["request_id"] = request_id
+        if has_diagnostics:
+            post_hook_kwargs["diagnostics"] = _diagnostics_payload(
+                outcome="notify_failed",
+                resolved=False,
+                wait_started=requested_at,
+                wait_ms=int((time.monotonic() - requested_at) * 1000),
+            )
+        _fire_approval_hook("post_approval_response", **post_hook_kwargs)
         return {"resolved": False, "choice": None, "notify_failed": True}
 
     # Block until the user responds or the canonical approval timeout elapses
@@ -4624,20 +4692,30 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     _drop_entry()
 
     choice = entry.result
+    waited_ms = int((time.monotonic() - requested_at) * 1000)
     # Normalize outcome for the post hook. Unresolved (timeout) and None both
     # mean the user never responded; report that explicitly so plugins can
     # distinguish timeout from explicit deny.
     _outcome = "timeout" if not resolved else (choice if choice else "timeout")
-    _fire_approval_hook(
-        "post_approval_response",
-        command=command,
-        description=description,
-        pattern_key=primary_key,
-        pattern_keys=list(all_keys),
-        session_key=session_key,
-        surface=surface,
-        choice=_outcome,
-    )
+    post_hook_kwargs = {
+        "command": command,
+        "description": description,
+        "pattern_key": primary_key,
+        "pattern_keys": list(all_keys),
+        "session_key": session_key,
+        "surface": active_surface,
+        "choice": _outcome,
+    }
+    if request_id:
+        post_hook_kwargs["request_id"] = request_id
+    if has_diagnostics:
+        post_hook_kwargs["diagnostics"] = _diagnostics_payload(
+            outcome=_outcome,
+            resolved=resolved,
+            wait_started=requested_at,
+            wait_ms=waited_ms,
+        )
+    _fire_approval_hook("post_approval_response", **post_hook_kwargs)
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 

@@ -870,10 +870,74 @@ def _request_protected_instruction_approval(
         return blocked.format(why="requires approval but the approval "
                                   "subsystem is unavailable.")
 
+    import hashlib
+    import inspect
+    import time
+    import uuid
+
+    def _ref(label: str, value: str | None) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return f"{label}:absent"
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+        return f"{label}:{digest}"
+
+    def _timeout_seconds() -> int | None:
+        try:
+            return int(_approval._get_approval_timeout())
+        except Exception:
+            return None
+
+    request_id = f"pfi_{uuid.uuid4().hex[:12]}"
+    session_key = _approval.get_current_session_key()
+    started_at = time.monotonic()
+
+    def _diagnostics(active_surface: str, callback_kind: str, *,
+                     outcome: str, resolved: bool | None,
+                     waited_ms: int | None = None) -> dict:
+        timing = {"timeout_seconds": _timeout_seconds()}
+        if waited_ms is not None:
+            timing["wait_ms"] = waited_ms
+        return {
+            "request": {
+                "id": request_id,
+                "kind": "protected_instruction_file",
+                "surface": active_surface,
+            },
+            "session": {
+                "key_ref": _ref("session", session_key),
+                "task_ref": _ref("task", task_id),
+            },
+            "callback": {"kind": callback_kind},
+            "policy": {
+                "requires_once": True,
+                "allow_session": False,
+                "allow_permanent": False,
+            },
+            "timing": timing,
+            "outcome": {
+                "status": outcome,
+                "resolved": resolved,
+            },
+        }
+
+    def _prompt_description(active_surface: str) -> str:
+        return (
+            f"{description}\n"
+            f"Request ID: {request_id}\n"
+            f"Surface: {active_surface}"
+        )
+
+    def _non_once_block(choice: str | None) -> str:
+        if choice in {"session", "always"}:
+            return blocked.format(
+                why="requires one-operation approval and did not receive a "
+                    "single-use consent.")
+        return blocked.format(why="was denied by the user.")
+
     # Gateway surface: block on the button round-trip when a notify callback
     # is registered for this session (Telegram/Discord/Slack). One-operation
     # only — no session/permanent buttons are offered.
-    session_key = _approval.get_current_session_key()
     notify_cb = None
     try:
         with _approval._lock:
@@ -882,31 +946,40 @@ def _request_protected_instruction_approval(
         notify_cb = None
 
     if notify_cb is not None:
+        active_surface = _approval._get_session_platform() or "gateway"
         approval_data = {
             "command": display,
             "pattern_key": "protected_instruction_file",
             "pattern_keys": ["protected_instruction_file"],
-            "description": description,
+            "description": _prompt_description(active_surface),
             "allow_permanent": False,
             "allow_session": False,
+            "request_id": request_id,
+            "active_surface": active_surface,
+            "diagnostics": _diagnostics(
+                active_surface,
+                "gateway_notify",
+                outcome="requested",
+                resolved=None,
+            ),
         }
         decision = _approval._await_gateway_decision(
-            session_key, notify_cb, approval_data, surface="gateway",
+            session_key, notify_cb, approval_data, surface=active_surface,
         )
         if decision.get("notify_failed"):
             return blocked.format(
                 why="requires approval but the approval request could not "
                     "be delivered.")
         choice = decision.get("choice")
-        if decision.get("resolved") and choice in {"once", "session", "always"}:
-            # One-operation grant regardless of the tapped scope — nothing
-            # is persisted for this gate.
+        if decision.get("resolved") and choice == "once":
+            # One-operation grant only. Session/permanent scope is never
+            # honored for protected instruction files.
             return None
         if not decision.get("resolved"):
             return blocked.format(
                 why="approval prompt timed out without a user response. "
                     "Silence is not consent.")
-        return blocked.format(why="was denied by the user.")
+        return _non_once_block(choice)
 
     # CLI surface: per-thread approval callback (prompt_toolkit panel).
     callback = None
@@ -917,20 +990,88 @@ def _request_protected_instruction_approval(
         callback = None
 
     if callback is not None:
+        active_surface = "cli"
+        prompt_description = _prompt_description(active_surface)
+        callback_diagnostics = _diagnostics(
+            active_surface,
+            "cli_callback",
+            outcome="requested",
+            resolved=None,
+        )
+
+        def _callback_with_diagnostics(command_text: str,
+                                       description_text: str,
+                                       **kwargs):
+            extra_kwargs = {
+                "request_id": request_id,
+                "active_surface": active_surface,
+                "diagnostics": callback_diagnostics,
+            }
+            try:
+                signature = inspect.signature(callback)
+            except (TypeError, ValueError):
+                signature = None
+
+            if signature is None:
+                return callback(command_text, description_text, **kwargs)
+
+            params = signature.parameters.values()
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+                merged = dict(kwargs)
+                merged.update(extra_kwargs)
+                return callback(command_text, description_text, **merged)
+
+            filtered = dict(kwargs)
+            for name, value in extra_kwargs.items():
+                if name in signature.parameters:
+                    filtered[name] = value
+            return callback(command_text, description_text, **filtered)
+
+        pre_payload = {
+            "command": redact_sensitive_text(display, force=True),
+            "description": redact_sensitive_text(prompt_description, force=True),
+            "pattern_key": "protected_instruction_file",
+            "pattern_keys": ["protected_instruction_file"],
+            "session_key": session_key,
+            "surface": active_surface,
+            "request_id": request_id,
+            "diagnostics": callback_diagnostics,
+        }
+        _approval._fire_approval_hook("pre_approval_request", **pre_payload)
         choice = _approval.prompt_dangerous_approval(
-            display, description,
+            display, prompt_description,
             allow_permanent=False,
             allow_session=False,
-            approval_callback=callback,
+            approval_callback=_callback_with_diagnostics,
+            smart_denied=True,
         )
-        if choice in {"once", "session", "always"}:
-            # One-operation grant; never persisted (see docstring).
+        waited_ms = max(0, int((time.monotonic() - started_at) * 1000))
+        _approval._fire_approval_hook(
+            "post_approval_response",
+            command=pre_payload["command"],
+            description=pre_payload["description"],
+            pattern_key="protected_instruction_file",
+            pattern_keys=["protected_instruction_file"],
+            session_key=session_key,
+            surface=active_surface,
+            request_id=request_id,
+            choice=choice or "deny",
+            diagnostics=_diagnostics(
+                active_surface,
+                "cli_callback",
+                outcome=choice or "deny",
+                resolved=choice not in {None, "", "timeout"},
+                waited_ms=waited_ms,
+            ),
+        )
+        if choice == "once":
+            # One-operation grant only; never persisted (see docstring).
             return None
         if choice == "timeout":
             return blocked.format(
                 why="approval prompt timed out without a user response. "
                     "Silence is not consent.")
-        return blocked.format(why="was denied by the user.")
+        return _non_once_block(choice)
 
     # No human channel at all (script, cron, background thread): fail
     # closed. Auto-approving here would recreate the persistence vector.
